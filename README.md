@@ -1,4 +1,4 @@
-<img src="logo.png" alt="进销存系统 Logo" width="300">
+<p align="center"><img src="logo.png" alt="进销存系统 Logo" width="300"></p>
 
 # 商户进销存
 
