@@ -1,0 +1,44 @@
+@media print {
+  @page { size: A4 portrait; margin: 12mm; }
+  body, .app-shell { min-height: 0; background: #fff !important; }
+  .sidebar, .topbar, .app-footer, .toast, .nav-scrim, .heading-actions,
+  .toolbar-row, .text-link, .row-actions, .icon-button, .button-primary,
+  .button-secondary { display: none !important; }
+  .app-shell:not(.print-order-mode) .main-area {
+    display: flex !important;
+    width: 100%;
+    min-height: 0;
+    margin: 0;
+  }
+  .app-shell:not(.print-order-mode) .page-content {
+    display: block !important;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+  }
+  .app-shell:not(.print-order-mode) .page-heading { display: block; margin: 0 0 15px; }
+  .app-shell:not(.print-order-mode) .page-heading h1 { font-size: 18px; }
+  .table-scroll, .table-panel { overflow: visible !important; }
+  .table-panel .data-table { width: 100%; min-width: 0 !important; white-space: normal; }
+  .table-panel .data-table th, .table-panel .data-table td {
+    height: auto;
+    padding: 6px 4px !important;
+    border-bottom: 1px solid #ccc;
+    color: #222 !important;
+    font-size: 10.25pt !important;
+    white-space: normal;
+  }
+  .table-panel .data-table tr { break-inside: avoid; }
+  .app-shell.print-order-mode .main-area { display: none !important; }
+  .print-order-mode .print-overlay { display: block !important; position: static; background: #fff; }
+  .print-order-mode .print-controls { display: none !important; }
+  .print-sheet { display: block !important; width: 100%; padding: 0; color: #111; }
+  .print-sheet h1 { text-align: center; font-size: 20px; font-weight: 600; margin: 12px 0 24px; }
+  .print-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 14px; margin-bottom: 14px; font-size: 15px; }
+  .print-sheet table { width: 100%; border-collapse: collapse; }
+  .print-sheet th, .print-sheet td { padding: 8px 6px; border: 1px solid #999; text-align: left; font-size: 14px; }
+  .print-sheet th { background: #f1f1f1; }
+  .print-total { text-align: right; margin-top: 14px; font-size: 17px; }
+  .print-note { margin-top: 26px; font-size: 15px; }
+  .signature-row { display: flex; justify-content: space-between; margin-top: 44px; font-size: 15px; }
+}
