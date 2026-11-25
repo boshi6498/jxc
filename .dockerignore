@@ -1,6 +1,10 @@
 .git
+.github
 node_modules
 dist
 data
+fnos
 .env
 npm-debug.log*
+*.fpk
+.DS_Store

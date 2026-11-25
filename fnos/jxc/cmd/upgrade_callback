@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+DATA_DIR="${TRIM_PKGVAR}/data"
+mkdir -p "$DATA_DIR"
+chmod 770 "$DATA_DIR"

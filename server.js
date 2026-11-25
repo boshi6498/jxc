@@ -11,12 +11,36 @@ const dataDirectory = path.resolve(process.env.DATA_DIR || path.join(root, 'data
 const databasePath = path.join(dataDirectory, 'jxc.sqlite');
 const port = Number(process.env.PORT || 3001);
 const appPassword = process.env.APP_PASSWORD;
-const appSecret = process.env.APP_SECRET;
 const superAdmin = (process.env.SUPER_ADMIN || '').trim().toLowerCase();
 const cookieName = 'jxc_session';
 const sessionDuration = 12 * 60 * 60 * 1000;
-if (!appSecret || appSecret.length < 32) throw new Error('APP_SECRET must contain at least 32 characters.');
 fs.mkdirSync(dataDirectory, { recursive: true });
+const appSecretPath = path.join(dataDirectory, '.app-secret');
+function loadOrCreateAppSecret() {
+  const configured = process.env.APP_SECRET;
+  if (configured) {
+    if (configured.length < 32) throw new Error('APP_SECRET must contain at least 32 characters.');
+    return configured;
+  }
+  try {
+    const persisted = fs.readFileSync(appSecretPath, 'utf8').trim();
+    if (persisted.length < 32) throw new Error(`${appSecretPath} must contain at least 32 characters.`);
+    return persisted;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const generated = crypto.randomBytes(48).toString('base64url');
+  try {
+    fs.writeFileSync(appSecretPath, `${generated}\n`, { flag: 'wx', mode: 0o600 });
+    return generated;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const persisted = fs.readFileSync(appSecretPath, 'utf8').trim();
+    if (persisted.length < 32) throw new Error(`${appSecretPath} must contain at least 32 characters.`);
+    return persisted;
+  }
+}
+const appSecret = loadOrCreateAppSecret();
 
 const schema = `
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);

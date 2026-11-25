@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ -z "${TRIM_PKGVAR:-}" ]; then
+  echo "TRIM_PKGVAR 未设置" >"${TRIM_TEMP_LOGFILE}"
+  exit 1
+fi
+
+DATA_DIR="${TRIM_PKGVAR}/data"
+mkdir -p "$DATA_DIR"
+chmod 770 "$DATA_DIR"
+
+if ! touch "${DATA_DIR}/.write_check" 2>/dev/null; then
+  echo "应用数据目录不可写: $DATA_DIR" >"${TRIM_TEMP_LOGFILE}"
+  exit 1
+fi
+rm -f "${DATA_DIR}/.write_check"

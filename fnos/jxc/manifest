@@ -1,0 +1,14 @@
+appname               = fn-jxc
+version               = 1.0.0
+display_name          = 商户进销存
+desc                  = 面向小型商贸团队的自托管进销存系统，支持采购、销售、库存、账款、备份及多账号管理。
+platform              = all
+source                = thirdparty
+maintainer            = boshi6498
+maintainer_url        = https://github.com/boshi6498/jxc
+distributor           = boshi6498
+distributor_url       = https://github.com/boshi6498/jxc
+os_min_version        = 1.1.8
+desktop_uidir         = ui
+desktop_applaunchname = fn-jxc.main
+disable_authorization_path = true

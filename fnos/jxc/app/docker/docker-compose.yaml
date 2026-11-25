@@ -1,0 +1,21 @@
+services:
+  jxc:
+    container_name: fn-jxc
+    image: ghcr.io/boshi6498/jxc:1.0.0
+    restart: unless-stopped
+    user: "${TRIM_UID}:${TRIM_GID}"
+    ports:
+      - "${APP_PORT}:3001"
+    environment:
+      PORT: "3001"
+      DATA_DIR: /app/data
+      COOKIE_SECURE: "false"
+      TZ: "${TIME_ZONE}"
+    volumes:
+      - "${TRIM_PKGVAR}/data:/app/data"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

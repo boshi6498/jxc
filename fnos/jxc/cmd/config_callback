@@ -1,0 +1,3 @@
+#!/bin/bash
+# 配置变更由 cmd/main status 中的 docker compose up -d 应用。
+exit 0

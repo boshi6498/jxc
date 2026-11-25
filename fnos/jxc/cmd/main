@@ -1,0 +1,28 @@
+#!/bin/bash
+
+COMPOSE_DIR="$(dirname "${TRIM_APPDEST}/docker/docker-compose.yaml")"
+
+cd "$COMPOSE_DIR" || {
+  echo "Docker Compose 目录不存在: $COMPOSE_DIR" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  start)
+    exit 0
+    ;;
+  stop)
+    exit 0
+    ;;
+  status)
+    if ! docker compose -p "$TRIM_APPNAME" up -d; then
+      echo "Docker Compose 启动失败" >"${TRIM_TEMP_LOGFILE}"
+      exit 1
+    fi
+    docker compose -p "$TRIM_APPNAME" ps --format '{{.State}}' 2>/dev/null | grep -qi 'running'
+    ;;
+  *)
+    echo "usage: $0 {start|stop|status}" >&2
+    exit 1
+    ;;
+esac
