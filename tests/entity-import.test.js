@@ -39,7 +39,7 @@ test('资料导入回滚及分类重命名保留关联', async () => {
     });
     const setCookie = response.headers.get('set-cookie');
     if (setCookie) cookie = setCookie.split(';')[0];
-    const result = await response.json();
+    const result = response.status === 204 ? null : await response.json();
     assert.equal(response.status, expected, JSON.stringify(result));
     return result;
   }
@@ -61,7 +61,19 @@ test('资料导入回滚及分类重命名保留关联', async () => {
     const product = { sku: 'SKU-1', name: '商品', specification: '规格', unit: '托', category: '新分类', cost: '1.25', price: '2', stock: '5', threshold: '3', stock_alert_enabled: '关闭', note: '备注' };
     await request('/api/products/import', 'POST', { rows: [product] }, 201);
     const failure = await request('/api/products/import', 'POST', { rows: [{ ...product, sku: 'SKU-2', category: '回滚分类', unit: '回滚单位' }, product] }, 400);
-    assert.match(failure.error, /第 2 条.*商品编码已存在/);
+    assert.match(failure.error, /第 2 条.*商品已存在.*商品编码/);
+    const categoryId = (await request('/api/init')).categories.find((category) => category.name === '新分类').id;
+    const sameName = await request('/api/products', 'POST', { name: product.name, sku: 'SKU-SAME-NAME', unit: product.unit, category_id: categoryId, stock: 1, cost: 1, price: 2 }, 201);
+    const duplicate = await request('/api/products', 'POST', { name: '另一个商品', sku: 'sku-1', unit: product.unit, category_id: categoryId, stock: 1, cost: 1, price: 2 }, 400);
+    assert.match(duplicate.error, /商品已存在.*商品编码/);
+    const editDuplicate = await request(`/api/products/${sameName.id}`, 'PUT', { ...sameName, sku: 'SkU-1' }, 400);
+    assert.match(editDuplicate.error, /商品已存在.*商品编码/);
+    const autoOne = await request('/api/products', 'POST', { name: '自动编码一', sku: '', unit: product.unit, category_id: categoryId, stock: 0, cost: 1, price: 2 }, 201);
+    const autoTwo = await request('/api/products', 'POST', { name: '自动编码二', sku: '', unit: product.unit, category_id: categoryId, stock: 0, cost: 1, price: 2 }, 201);
+    assert.notEqual(autoOne.sku, autoTwo.sku);
+    await request(`/api/products/${sameName.id}`, 'DELETE', undefined, 204);
+    await request(`/api/products/${autoOne.id}`, 'DELETE', undefined, 204);
+    await request(`/api/products/${autoTwo.id}`, 'DELETE', undefined, 204);
     await request('/api/products/import', 'POST', { rows: [{ ...product, sku: 'SKU-3', stock: '1.5' }] }, 400);
     const init = await request('/api/init');
     assert.equal(init.suppliers.length, 1);

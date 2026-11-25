@@ -12,6 +12,7 @@ const databasePath = path.join(dataDirectory, 'jxc.sqlite');
 const port = Number(process.env.PORT || 3001);
 const appPassword = process.env.APP_PASSWORD;
 const appSecret = process.env.APP_SECRET;
+const superAdmin = (process.env.SUPER_ADMIN || '').trim().toLowerCase();
 const cookieName = 'jxc_session';
 const sessionDuration = 12 * 60 * 60 * 1000;
 if (!appSecret || appSecret.length < 32) throw new Error('APP_SECRET must contain at least 32 characters.');
@@ -30,10 +31,11 @@ const schema = `
   CREATE TABLE IF NOT EXISTS customer_receipt_vouchers (receipt_id INTEGER PRIMARY KEY REFERENCES customer_receipts(id) ON DELETE CASCADE, mime_type TEXT NOT NULL, data_base64 TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS supplier_payments (id INTEGER PRIMARY KEY AUTOINCREMENT, supplier_id INTEGER NOT NULL, date TEXT NOT NULL, total_cents INTEGER NOT NULL, payment_method TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS supplier_payment_allocations (id INTEGER PRIMARY KEY AUTOINCREMENT, payment_id INTEGER NOT NULL REFERENCES supplier_payments(id) ON DELETE CASCADE, order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, amount_cents INTEGER NOT NULL CHECK(amount_cents > 0), UNIQUE(payment_id, order_id));
-  CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, product_id INTEGER REFERENCES products(id), product_name TEXT NOT NULL, specification TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL, quantity REAL NOT NULL CHECK(quantity > 0), unit_price_cents INTEGER NOT NULL, subtotal_cents INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, product_id INTEGER REFERENCES products(id), product_name TEXT NOT NULL, specification TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL, quantity REAL NOT NULL CHECK(quantity > 0), unit_price_cents INTEGER NOT NULL, cost_cents INTEGER NOT NULL DEFAULT 0, subtotal_cents INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS order_vouchers (order_id INTEGER PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE, mime_type TEXT NOT NULL, data_base64 TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS order_sales_lists (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, file_name TEXT NOT NULL, mime_type TEXT NOT NULL, data_base64 TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS suspended_orders (id TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, data TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS stock_movements (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL REFERENCES products(id), order_id INTEGER REFERENCES orders(id), kind TEXT NOT NULL, quantity_delta REAL NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS stock_movements (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER REFERENCES products(id), order_id INTEGER REFERENCES orders(id), kind TEXT NOT NULL, quantity_delta REAL NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, product_name TEXT, product_unit TEXT);
   CREATE TABLE IF NOT EXISTS stocktakes (id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL UNIQUE, date TEXT NOT NULL, category_id INTEGER REFERENCES categories(id), note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS stocktake_items (id INTEGER PRIMARY KEY AUTOINCREMENT, stocktake_id INTEGER NOT NULL REFERENCES stocktakes(id) ON DELETE CASCADE, product_id INTEGER REFERENCES products(id), product_name TEXT NOT NULL, expected REAL NOT NULL, counted REAL NOT NULL, difference REAL NOT NULL);
   CREATE INDEX IF NOT EXISTS orders_type_date_idx ON orders(type, date DESC, id DESC);
@@ -50,6 +52,19 @@ function initializeUserDatabase(connection) {
   connection.pragma('journal_mode = WAL');
   connection.pragma('foreign_keys = ON');
   connection.exec(schema);
+  const movementColumns = connection.prepare('PRAGMA table_info(stock_movements)').all();
+  if (movementColumns.find((column) => column.name === 'product_id').notnull) {
+    connection.transaction(() => {
+      connection.exec(`
+        CREATE TABLE stock_movements_migrated (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER REFERENCES products(id), order_id INTEGER REFERENCES orders(id), kind TEXT NOT NULL, quantity_delta REAL NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, product_name TEXT, product_unit TEXT);
+        INSERT INTO stock_movements_migrated (id, product_id, order_id, kind, quantity_delta, note, created_at)
+          SELECT id, product_id, order_id, kind, quantity_delta, note, created_at FROM stock_movements;
+        DROP TABLE stock_movements;
+        ALTER TABLE stock_movements_migrated RENAME TO stock_movements;
+        CREATE INDEX stock_movements_product_idx ON stock_movements(product_id, id DESC);
+      `);
+    })();
+  }
   const orderColumns = new Set(connection.prepare('PRAGMA table_info(orders)').all().map((column) => column.name));
   if (!orderColumns.has('paid_cents')) {
     connection.exec('ALTER TABLE orders ADD COLUMN paid_cents INTEGER NOT NULL DEFAULT 0');
@@ -71,6 +86,12 @@ function initializeUserDatabase(connection) {
         SELECT 1 FROM stock_movements
         WHERE stock_movements.note = orders.number || ' 已反审核'
       )`);
+  }
+  const orderItemColumns = new Set(connection.prepare('PRAGMA table_info(order_items)').all().map((column) => column.name));
+  if (!orderItemColumns.has('cost_cents')) {
+    connection.exec('ALTER TABLE order_items ADD COLUMN cost_cents INTEGER NOT NULL DEFAULT 0');
+    connection.exec(`UPDATE order_items
+      SET cost_cents = COALESCE((SELECT products.cost_cents FROM products WHERE products.id = order_items.product_id), 0)`);
   }
   const productColumns = new Set(connection.prepare('PRAGMA table_info(products)').all().map((column) => column.name));
   if (!productColumns.has('stock_alert_enabled')) {
@@ -103,6 +124,11 @@ accountsDb.exec(`CREATE TABLE IF NOT EXISTS users (
   database_file TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`);
+const accountColumns = new Set(accountsDb.prepare('PRAGMA table_info(users)').all().map((column) => column.name));
+if (!accountColumns.has('enabled')) accountsDb.exec('ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1');
+if (!accountColumns.has('session_version')) accountsDb.exec('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0');
+if (!accountColumns.has('recovery_hash')) accountsDb.exec('ALTER TABLE users ADD COLUMN recovery_hash TEXT');
+if (!accountColumns.has('must_change_password')) accountsDb.exec('ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0');
 const databaseContext = new AsyncLocalStorage();
 const userDatabases = new Map();
 const defaultDatabase = new Database(databasePath);
@@ -117,8 +143,8 @@ const db = new Proxy({}, {
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') };
 }
-function setSessionCookie(res, userId) {
-  const token = Buffer.from(JSON.stringify({ uid: userId, exp: Date.now() + sessionDuration })).toString('base64url');
+function setSessionCookie(res, user) {
+  const token = Buffer.from(JSON.stringify({ uid: user.id, ver: user.session_version, exp: Date.now() + sessionDuration })).toString('base64url');
   const secure = process.env.COOKIE_SECURE === 'true' ? '; Secure' : '';
   res.setHeader('Set-Cookie', `${cookieName}=${token}.${sessionSignature(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${sessionDuration / 1000}${secure}`);
 }
@@ -130,11 +156,46 @@ if (appPassword && accountsDb.prepare('SELECT COUNT(*) AS count FROM users').get
 
 const app = express();
 app.disable('x-powered-by');
+app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
 app.use(express.json({ limit: '30mb' }));
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 const integerId = (value) => /^\d+$/.test(String(value)) && Number(value) > 0 ? Number(value) : null;
 const text = (value, max = 500) => typeof value === 'string' ? value.trim().slice(0, max) : '';
 function sessionSignature(token) { return crypto.createHmac('sha256', appSecret).update(token).digest('base64url'); }
+const validPassword = (password) => typeof password === 'string' && password.length >= 8 && password.length <= 64 && /[A-Za-z]/.test(password) && /\d/.test(password) && /^[A-Za-z\d]+$/.test(password);
+const isSuperAdmin = (user) => Boolean(superAdmin && user.username.toLowerCase() === superAdmin);
+const recoveryHash = (code) => crypto.createHash('sha256').update(code).digest('hex');
+function newRecoveryCode() { return crypto.randomBytes(24).toString('hex'); }
+function passwordMatches(user, password) {
+  if (typeof password !== 'string' || Buffer.byteLength(password) > 1024) return false;
+  const provided = Buffer.from(hashPassword(password, user.salt).hash, 'hex');
+  const expected = Buffer.from(user.password_hash, 'hex');
+  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
+}
+const attempts = new Map();
+function limitAuthAttempts(req, res, next) {
+  const now = Date.now();
+  for (const [key, entry] of attempts) if (entry.expires <= now) attempts.delete(key);
+  const username = req.user?.username || (typeof req.body?.username === 'string' ? req.body.username.trim().toLowerCase().slice(0, 32) : '');
+  const keys = [`ip:${req.ip}`, `user:${username}`];
+  if (keys.some((key, index) => (attempts.get(key)?.count || 0) >= (index === 0 ? 50 : 10))) return res.status(429).json({ error: '尝试次数过多，请 15 分钟后再试' });
+  for (const key of keys) {
+    const entry = attempts.get(key) || { count: 0, expires: now + 15 * 60 * 1000 };
+    entry.count += 1;
+    attempts.set(key, entry);
+  }
+  res.once('finish', () => {
+    if (res.statusCode >= 400) return;
+    for (const key of keys) {
+      const entry = attempts.get(key);
+      if (entry) {
+        entry.count -= 1;
+        if (entry.count <= 0) attempts.delete(key);
+      }
+    }
+  });
+  next();
+}
 function sessionUser(req) {
   const cookie = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${cookieName}=`));
   if (!cookie) return null;
@@ -145,8 +206,9 @@ function sessionUser(req) {
   if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) return null;
   try {
     const session = JSON.parse(Buffer.from(token, 'base64url').toString());
-    if (!Number.isInteger(session.uid) || session.exp <= Date.now()) return null;
-    return accountsDb.prepare('SELECT id, username, database_file FROM users WHERE id = ?').get(session.uid) || null;
+    if (!Number.isInteger(session.uid) || !Number.isFinite(session.exp) || session.exp <= Date.now()) return null;
+    const user = accountsDb.prepare('SELECT id, username, database_file, enabled, session_version, must_change_password FROM users WHERE id = ?').get(session.uid);
+    return user && user.enabled && (session.ver ?? 0) === user.session_version ? user : null;
   } catch { return null; }
 }
 function userDatabase(user) {
@@ -160,6 +222,7 @@ function userDatabase(user) {
 function requireSession(req, res, next) {
   const user = sessionUser(req);
   if (!user) return res.status(401).json({ error: '登录已失效，请重新登录' });
+  if (user.must_change_password && req.path !== '/account/change-password') return res.status(403).json({ error: '请先修改临时密码' });
   req.user = user;
   return databaseContext.run({ database: userDatabase(user) }, next);
 }
@@ -211,6 +274,33 @@ function saveOrderVoucher(orderId, voucher) {
       .run(orderId, voucher.mimeType, voucher.dataBase64);
   }
 }
+function parseSalesListVouchers(value) {
+  if (!Array.isArray(value) || value.length > 4) return { error: '销售清单最多可上传 4 张图片' };
+  const items = [];
+  for (const item of value) {
+    if (!item || typeof item.fileName !== 'string' || !item.fileName.trim() || item.fileName.length > 255) return { error: '销售清单文件名无效' };
+    if (item.id !== undefined) {
+      if (!Number.isSafeInteger(Number(item.id)) || Number(item.id) <= 0) return { error: '销售清单凭证无效' };
+      items.push({ id: Number(item.id), fileName: item.fileName.trim() });
+      continue;
+    }
+    const voucher = parsePaymentVoucher(item.dataUrl);
+    if (voucher?.error) return { error: '销售清单只支持 JPG、PNG 或 WebP 图片，且每张不能超过 5 MB' };
+    items.push({ fileName: item.fileName.trim(), ...voucher });
+  }
+  return { items };
+}
+function saveOrderSalesLists(orderId, items) {
+  const existing = db.prepare('SELECT id FROM order_sales_lists WHERE order_id = ?').all(orderId);
+  const allowedIds = new Set(existing.map((row) => row.id));
+  if (items.some((item) => item.id && !allowedIds.has(item.id))) throw new Error('销售清单凭证无效');
+  const keepIds = items.filter((item) => item.id).map((item) => item.id);
+  if (keepIds.length !== new Set(keepIds).size) throw new Error('销售清单凭证重复');
+  if (keepIds.length) db.prepare(`DELETE FROM order_sales_lists WHERE order_id = ? AND id NOT IN (${keepIds.map(() => '?').join(',')})`).run(orderId, ...keepIds);
+  else db.prepare('DELETE FROM order_sales_lists WHERE order_id = ?').run(orderId);
+  const insert = db.prepare('INSERT INTO order_sales_lists (order_id,file_name,mime_type,data_base64) VALUES (?,?,?,?)');
+  for (const item of items) if (!item.id) insert.run(orderId, item.fileName, item.mimeType, item.dataBase64);
+}
 function entityRoutes(name, requiredField) {
   const table = name;
   app.get(`/api/${name}`, (_req, res) => res.json(db.prepare(`SELECT * FROM ${table} ORDER BY name COLLATE NOCASE, id`).all()));
@@ -247,13 +337,14 @@ function entityRoutes(name, requiredField) {
             values = contactValues(row, requiredField);
           }
           if (!values) throw new Error(name === 'products' ? '商品名称、单位、价格或库存无效' : '名称不能为空');
+          if (name === 'products') assertProductSkuAvailable(values.sku);
           const columns = Object.keys(values);
           db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`).run(...Object.values(values));
         }
       })();
       return res.status(201).json({ imported: rows.length });
     } catch (error) {
-      const message = error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? '商品编码已存在' : error.message;
+      const message = error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? '商品已存在：商品编码已被使用' : error.message;
       return sendError(res, `第 ${rowNumber} 条记录导入失败：${message}；本次未导入任何资料`);
     }
   });
@@ -262,11 +353,12 @@ function entityRoutes(name, requiredField) {
     const values = name === 'products' ? productValues(body) : contactValues(body, requiredField);
     if (!values) return sendError(res, name === 'products' ? '请填写商品名称、单位及有效价格' : '请填写必填名称');
     try {
+      if (name === 'products') assertProductSkuAvailable(values.sku);
       const columns = Object.keys(values);
       const result = db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`).run(...Object.values(values));
       const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(result.lastInsertRowid);
       return res.status(201).json(name === 'products' ? serializeProduct(row) : row);
-    } catch (error) { return sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? '商品编码已存在' : error.message); }
+    } catch (error) { return sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? '商品已存在：商品编码已被使用' : error.message); }
   });
   app.put(`/api/${name}/:id`, (req, res) => {
     const id = integerId(req.params.id);
@@ -278,19 +370,27 @@ function entityRoutes(name, requiredField) {
     const values = name === 'products' ? productValues(body) : contactValues(body, requiredField);
     if (!values) return sendError(res, name === 'products' ? '请填写商品名称、单位及有效价格' : '请填写必填名称');
     try {
+      if (name === 'products') assertProductSkuAvailable(values.sku, id);
       const columns = Object.keys(values);
       const result = db.prepare(`UPDATE ${table} SET ${columns.map((column) => `${column} = ?`).join(',')} WHERE id = ?`).run(...Object.values(values), id);
       if (!result.changes) return sendError(res, '记录不存在', 404);
       const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id);
       return res.json(name === 'products' ? serializeProduct(row) : row);
-    } catch (error) { return sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? '商品编码已存在' : error.message); }
+    } catch (error) { return sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? '商品已存在：商品编码已被使用' : error.message); }
   });
   app.delete(`/api/${name}/:id`, (req, res) => {
     const id = integerId(req.params.id);
     if (!id) return sendError(res, '记录编号无效');
     if (name === 'products') {
+      const product = db.prepare('SELECT name, unit FROM products WHERE id = ?').get(id);
+      if (!product) return sendError(res, '记录不存在', 404);
       const referenced = db.prepare('SELECT 1 FROM order_items WHERE product_id = ? UNION SELECT 1 FROM stocktake_items WHERE product_id = ? LIMIT 1').get(id, id);
       if (referenced) return sendError(res, '该商品已有业务记录，不能删除；可将库存调整为 0', 409);
+      db.transaction(() => {
+        db.prepare('UPDATE stock_movements SET product_name = ?, product_unit = ?, product_id = NULL WHERE product_id = ?').run(product.name, product.unit, id);
+        db.prepare('DELETE FROM products WHERE id = ?').run(id);
+      })();
+      return res.status(204).end();
     }
     if (name === 'customers' && db.prepare('SELECT 1 FROM customer_receipts WHERE customer_id = ? LIMIT 1').get(id)) return sendError(res, '该客户已有收款记录，不能删除', 409);
     if (name === 'suppliers' && db.prepare('SELECT 1 FROM supplier_payments WHERE supplier_id = ? LIMIT 1').get(id)) return sendError(res, '该供应商已有付款记录，不能删除', 409);
@@ -302,6 +402,21 @@ function contactValues(body, requiredField) {
   const name = text(body[requiredField], 120);
   if (!name) return null;
   return { name, contact: text(body.contact, 80), phone: text(body.phone, 60), email: text(body.email, 120), address: text(body.address, 300), note: text(body.note, 500) };
+}
+function nextProductSku() {
+  const base = `SP-${Date.now()}`;
+  let sku = base;
+  let suffix = 1;
+  while (db.prepare('SELECT 1 FROM products WHERE sku = ? COLLATE NOCASE').get(sku)) {
+    sku = `${base}-${suffix++}`;
+  }
+  return sku;
+}
+function assertProductSkuAvailable(sku, excludedId = null) {
+  const existing = excludedId
+    ? db.prepare('SELECT id FROM products WHERE sku = ? COLLATE NOCASE AND id != ?').get(sku, excludedId)
+    : db.prepare('SELECT id FROM products WHERE sku = ? COLLATE NOCASE').get(sku);
+  if (existing) throw new Error('商品已存在：商品编码已被使用');
 }
 function productValues(body) {
   const name = text(body.name, 120);
@@ -316,29 +431,31 @@ function productValues(body) {
     ? 1
     : body.stock_alert_enabled === false || body.stock_alert_enabled === 0 ? 0 : null;
   if (!name || !unit || !category || cost === null || price === null || stock === null || threshold === null || stockAlertEnabled === null) return null;
-  return { sku: text(body.sku, 50) || `SP-${Date.now().toString().slice(-8)}`, name, specification: text(body.specification, 120), unit, category_id: category.id, cost_cents: cost, price_cents: price, stock, threshold, stock_alert_enabled: stockAlertEnabled, note: text(body.note, 500) };
+  return { sku: text(body.sku, 50) || nextProductSku(), name, specification: text(body.specification, 120), unit, category_id: category.id, cost_cents: cost, price_cents: price, stock, threshold, stock_alert_enabled: stockAlertEnabled, note: text(body.note, 500) };
 }
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.get('/api/auth', (req, res) => {
   const user = sessionUser(req);
-  return res.json({ authenticated: Boolean(user), username: user?.username || '' });
+  return res.json({ authenticated: Boolean(user), username: user?.username || '', isSuperAdmin: user ? isSuperAdmin(user) : false, mustChangePassword: Boolean(user?.must_change_password) });
 });
 app.post('/api/register', (req, res) => {
   const username = typeof req.body?.username === 'string' ? req.body.username.trim().toLowerCase() : '';
   const password = req.body?.password;
   if (!/^[a-z0-9_-]{3,32}$/.test(username)) return sendError(res, '账号名须为 3-32 位字母、数字、下划线或连字符');
-  if (typeof password !== 'string' || password.length < 8 || password.length > 64 || !/[A-Za-z]/.test(password) || !/\d/.test(password) || !/^[A-Za-z\d]+$/.test(password)) {
+  if (username === superAdmin && !accountsDb.prepare('SELECT id FROM users WHERE username = ?').get(username)) return sendError(res, '该账号名已保留，请联系系统管理员', 409);
+  if (!validPassword(password)) {
     return sendError(res, '密码须为 8-64 位，且同时包含字母和数字');
   }
   try {
     const { salt, hash } = hashPassword(password);
+    const recoveryCode = newRecoveryCode();
     const createUser = accountsDb.transaction(() => {
       const firstAccount = accountsDb.prepare('SELECT COUNT(*) AS count FROM users').get().count === 0;
       const databaseFile = firstAccount ? path.basename(databasePath) : `account-${accountsDb.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS id FROM users').get().id}.sqlite`;
-      const result = accountsDb.prepare('INSERT INTO users (username,salt,password_hash,database_file) VALUES (?,?,?,?)')
-        .run(username, salt, hash, databaseFile);
-      return accountsDb.prepare('SELECT id, username, database_file FROM users WHERE id = ?').get(result.lastInsertRowid);
+      const result = accountsDb.prepare('INSERT INTO users (username,salt,password_hash,database_file,recovery_hash) VALUES (?,?,?,?,?)')
+        .run(username, salt, hash, databaseFile, recoveryHash(recoveryCode));
+      return accountsDb.prepare('SELECT id, username, database_file, session_version FROM users WHERE id = ?').get(result.lastInsertRowid);
     });
     const user = createUser();
     try { userDatabase(user); }
@@ -346,24 +463,37 @@ app.post('/api/register', (req, res) => {
       accountsDb.prepare('DELETE FROM users WHERE id = ?').run(user.id);
       throw error;
     }
-    setSessionCookie(res, user.id);
-    return res.status(201).json({ authenticated: true, username: user.username });
+    setSessionCookie(res, user);
+    return res.status(201).json({ authenticated: true, username: user.username, isSuperAdmin: isSuperAdmin(user), recoveryCode });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendError(res, '该账号名已被注册', 409);
     console.error(error);
     return sendError(res, '注册失败，请稍后重试', 500);
   }
 });
-app.post('/api/login', (req, res) => {
+app.post('/api/login', limitAuthAttempts, (req, res) => {
   const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
   const password = req.body?.password;
-  const user = accountsDb.prepare('SELECT id, username, salt, password_hash, database_file FROM users WHERE username = ?').get(username);
-  if (!user || typeof password !== 'string' || Buffer.byteLength(password) > 1024) return sendError(res, '账号或密码不正确', 401);
-  const provided = Buffer.from(hashPassword(password, user.salt).hash, 'hex');
-  const expected = Buffer.from(user.password_hash, 'hex');
-  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) return sendError(res, '账号或密码不正确', 401);
-  setSessionCookie(res, user.id);
-  return res.json({ authenticated: true, username: user.username });
+  const user = accountsDb.prepare('SELECT id, username, salt, password_hash, database_file, enabled, session_version, must_change_password FROM users WHERE username = ?').get(username);
+  if (!user || !user.enabled || !passwordMatches(user, password)) return sendError(res, '账号或密码不正确', 401);
+  setSessionCookie(res, user);
+  return res.json({ authenticated: true, username: user.username, isSuperAdmin: isSuperAdmin(user), mustChangePassword: Boolean(user.must_change_password) });
+});
+app.post('/api/recover-password', limitAuthAttempts, (req, res) => {
+  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
+  const code = typeof req.body?.recoveryCode === 'string' ? req.body.recoveryCode.trim().toLowerCase() : '';
+  if (!validPassword(req.body?.password)) return sendError(res, '密码须为 8-64 位，且同时包含字母和数字');
+  if (!/^[a-f0-9]{48}$/.test(code)) return sendError(res, '账号或恢复码不正确，或账号已停用', 401);
+  const user = accountsDb.prepare('SELECT id, enabled, recovery_hash FROM users WHERE username = ?').get(username);
+  const candidate = Buffer.from(recoveryHash(code));
+  const expected = Buffer.from(user?.recovery_hash || '0'.repeat(64));
+  if (!user || !user.enabled || !crypto.timingSafeEqual(candidate, expected)) return sendError(res, '账号或恢复码不正确，或账号已停用', 401);
+  const { salt, hash } = hashPassword(req.body.password);
+  const recoveryCode = newRecoveryCode();
+  const result = accountsDb.prepare('UPDATE users SET salt = ?, password_hash = ?, recovery_hash = ?, must_change_password = 0, session_version = session_version + 1 WHERE id = ? AND recovery_hash = ? AND enabled = 1')
+    .run(salt, hash, recoveryHash(recoveryCode), user.id, user.recovery_hash);
+  if (!result.changes) return sendError(res, '恢复码已失效，请重新尝试', 409);
+  return res.json({ recoveryCode });
 });
 app.post('/api/logout', (_req, res) => {
   const secure = process.env.COOKIE_SECURE === 'true' ? '; Secure' : '';
@@ -371,6 +501,52 @@ app.post('/api/logout', (_req, res) => {
   return res.status(204).end();
 });
 app.use('/api', requireSession);
+app.post('/api/account/change-password', limitAuthAttempts, (req, res) => {
+  const user = accountsDb.prepare('SELECT id, username, salt, password_hash, session_version FROM users WHERE id = ?').get(req.user.id);
+  if (!passwordMatches(user, req.body?.currentPassword)) return sendError(res, '原密码不正确', 401);
+  if (!validPassword(req.body?.password)) return sendError(res, '密码须为 8-64 位，且同时包含字母和数字');
+  if (req.body.currentPassword === req.body.password) return sendError(res, '新密码不能与原密码相同');
+  const { salt, hash } = hashPassword(req.body.password);
+  const recoveryCode = newRecoveryCode();
+  accountsDb.prepare('UPDATE users SET salt = ?, password_hash = ?, recovery_hash = ?, must_change_password = 0, session_version = session_version + 1 WHERE id = ?').run(salt, hash, recoveryHash(recoveryCode), user.id);
+  setSessionCookie(res, { ...user, session_version: user.session_version + 1 });
+  return res.json({ recoveryCode });
+});
+app.post('/api/account/recovery-code', limitAuthAttempts, (req, res) => {
+  const user = accountsDb.prepare('SELECT salt, password_hash FROM users WHERE id = ?').get(req.user.id);
+  if (!passwordMatches(user, req.body?.password)) return sendError(res, '密码不正确', 401);
+  const recoveryCode = newRecoveryCode();
+  accountsDb.prepare('UPDATE users SET recovery_hash = ? WHERE id = ?').run(recoveryHash(recoveryCode), req.user.id);
+  return res.json({ recoveryCode });
+});
+function requireSuperAdmin(req, res, next) {
+  if (!isSuperAdmin(req.user)) return sendError(res, '无权管理用户', 403);
+  return next();
+}
+app.get('/api/admin/users', requireSuperAdmin, (_req, res) => {
+  const users = accountsDb.prepare('SELECT id, username, enabled, created_at FROM users ORDER BY id').all().map((user) => ({ ...user, isSuperAdmin: isSuperAdmin(user) }));
+  return res.json({ users, total: users.length, enabled: users.filter((user) => user.enabled).length });
+});
+app.put('/api/admin/users/:id/enabled', requireSuperAdmin, (req, res) => {
+  const id = integerId(req.params.id);
+  if (!id || typeof req.body?.enabled !== 'boolean') return sendError(res, '用户状态无效');
+  const user = accountsDb.prepare('SELECT id, username, enabled FROM users WHERE id = ?').get(id);
+  if (!user) return sendError(res, '用户不存在', 404);
+  if (isSuperAdmin(user)) return sendError(res, '不能停用超级管理员', 409);
+  accountsDb.prepare('UPDATE users SET enabled = ?, session_version = session_version + 1 WHERE id = ?').run(req.body.enabled ? 1 : 0, id);
+  return res.json({ updated: true });
+});
+app.post('/api/admin/users/:id/reset-password', requireSuperAdmin, (req, res) => {
+  const id = integerId(req.params.id);
+  const user = id && accountsDb.prepare('SELECT id, username, enabled FROM users WHERE id = ?').get(id);
+  if (!user) return sendError(res, '用户不存在', 404);
+  if (isSuperAdmin(user)) return sendError(res, '不能通过此方式重置超级管理员密码', 409);
+  if (!user.enabled) return sendError(res, '请先启用该账号', 409);
+  const temporaryPassword = `A1${crypto.randomBytes(12).toString('hex')}`;
+  const { salt, hash } = hashPassword(temporaryPassword);
+  accountsDb.prepare('UPDATE users SET salt = ?, password_hash = ?, recovery_hash = NULL, must_change_password = 1, session_version = session_version + 1 WHERE id = ?').run(salt, hash, id);
+  return res.json({ temporaryPassword });
+});
 app.get('/api/init', (_req, res) => {
   const settings = Object.fromEntries(db.prepare('SELECT key, value FROM settings').all().map(({ key, value }) => [key, value]));
   const products = db.prepare('SELECT * FROM products ORDER BY name COLLATE NOCASE').all().map(serializeProduct);
@@ -632,10 +808,13 @@ app.post('/api/suspended-orders', (req, res) => {
       typeof draft.removeVoucher !== 'boolean') return sendError(res, '挂单数据无效');
   if (draft.paymentVoucher && parsePaymentVoucher(draft.paymentVoucher).error) return sendError(res, '付款凭证无效');
   if (draft.paymentVoucher !== '' && typeof draft.paymentVoucher !== 'string') return sendError(res, '付款凭证无效');
+  const salesLists = draft.salesListVouchers === undefined ? [] : parseSalesListVouchers(draft.salesListVouchers);
+  if (salesLists.error) return sendError(res, salesLists.error);
   const data = JSON.stringify({
     kind: 'order', type: draft.type, lines: draft.lines.map(({ productId, quantity: count, unitPrice }) => ({ productId, quantity: count, unitPrice })),
     partyId: draft.partyId, orderDate: draft.orderDate, paidAmount: draft.paidAmount, paymentMethod: draft.paymentMethod,
-    paymentVoucher: draft.paymentVoucher, voucherName: draft.voucherName, removeVoucher: draft.removeVoucher, note: draft.note,
+    paymentVoucher: draft.paymentVoucher, voucherName: draft.voucherName, removeVoucher: draft.removeVoucher,
+    salesListVouchers: draft.salesListVouchers || [], note: draft.note,
   });
   if (draft.suspendedId) {
     if (typeof draft.suspendedId !== 'string' || !Number.isSafeInteger(draft.suspendedVersion)) return sendError(res, '挂单标识无效');
@@ -665,10 +844,16 @@ app.get('/api/orders', (req, res) => {
   if (to) { conditions.push('date <= ?'); values.push(to); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const orders = db.prepare(`SELECT orders.*, EXISTS(SELECT 1 FROM order_vouchers WHERE order_id = orders.id) AS has_voucher FROM orders ${where} ORDER BY date DESC, id DESC`).all(...values).map(serializeOrder);
+  const salesLists = db.prepare('SELECT id, order_id, file_name AS fileName FROM order_sales_lists ORDER BY id').all();
+  const salesListsByOrder = new Map();
+  for (const voucher of salesLists) {
+    if (!salesListsByOrder.has(voucher.order_id)) salesListsByOrder.set(voucher.order_id, []);
+    salesListsByOrder.get(voucher.order_id).push({ id: voucher.id, fileName: voucher.fileName });
+  }
   const items = db.prepare(`SELECT order_items.* FROM order_items JOIN orders ON orders.id = order_items.order_id ${where}`).all(...values);
   const byOrder = new Map();
-  for (const item of items) { if (!byOrder.has(item.order_id)) byOrder.set(item.order_id, []); byOrder.get(item.order_id).push({ ...item, unit_price: asMoney(item.unit_price_cents), subtotal: asMoney(item.subtotal_cents) }); }
-  return res.json(orders.map((order) => ({ ...order, items: byOrder.get(order.id) || [] })));
+  for (const item of items) { if (!byOrder.has(item.order_id)) byOrder.set(item.order_id, []); byOrder.get(item.order_id).push({ ...item, unit_price: asMoney(item.unit_price_cents), cost: asMoney(item.cost_cents), subtotal: asMoney(item.subtotal_cents), cost_cents: undefined }); }
+  return res.json(orders.map((order) => ({ ...order, items: byOrder.get(order.id) || [], sales_list_vouchers: salesListsByOrder.get(order.id) || [] })));
 });
 app.post('/api/orders', (req, res) => {
   const { type, partyId: rawPartyId, date: rawDate, note = '', items: rawItems, paidAmount: rawPaidAmount = 0, paymentMethod: rawPaymentMethod = '' } = req.body || {};
@@ -676,6 +861,9 @@ app.post('/api/orders', (req, res) => {
   if (suspendedId !== undefined && (typeof suspendedId !== 'string' || !Number.isSafeInteger(suspendedVersion))) return sendError(res, '挂单标识无效');
   const voucher = req.body?.paymentVoucher === undefined || req.body.paymentVoucher === null ? null : parsePaymentVoucher(req.body.paymentVoucher);
   if (voucher?.error) return sendError(res, voucher.error);
+  const salesLists = req.body?.salesListVouchers === undefined ? { items: [] } : parseSalesListVouchers(req.body.salesListVouchers);
+  if (salesLists.error) return sendError(res, salesLists.error);
+  if (salesLists.items.some((item) => item.id)) return sendError(res, '新订单不能使用已有销售清单');
   const date = dateValue(rawDate);
   if (!['purchase', 'sale'].includes(type)) return sendError(res, '单据类型无效');
   if (!date) return sendError(res, '请选择有效单据日期');
@@ -694,12 +882,23 @@ app.post('/api/orders', (req, res) => {
     if (!product || count === null || unitPrice === null) return sendError(res, '商品、数量或单价无效');
     lines.push({ product, quantity: count, unitPrice, subtotal: Math.round(count * unitPrice) });
   }
+  if (type === 'sale') {
+    const quantities = new Map();
+    for (const line of lines) quantities.set(line.product.id, (quantities.get(line.product.id) || 0) + line.quantity);
+    for (const line of lines) {
+      const quantity = quantities.get(line.product.id);
+      if (quantity > line.product.stock) return sendError(res, `“${line.product.name}”库存不足：当前库存 ${line.product.stock}，订单数量 ${quantity}`, 409);
+      quantities.delete(line.product.id);
+    }
+  }
   const total = lines.reduce((sum, line) => sum + line.subtotal, 0);
   const paid = cents(rawPaidAmount);
   if (paid === null || paid > total) return sendError(res, `${type === 'sale' ? '收款' : '付款'}金额不能小于零或超过单据金额`);
   const paymentMethods = ['现金', '微信', '支付宝', '银行转账', '其他'];
   const paymentMethod = paid === 0 ? (type === 'sale' ? '未收款' : '未付款') : text(rawPaymentMethod, 30);
   if (paid > 0 && !paymentMethods.includes(paymentMethod)) return sendError(res, `请选择有效的${type === 'sale' ? '收款' : '付款'}方式`);
+  if (type === 'purchase' && salesLists.items.length) return sendError(res, '采购订单不能上传销售清单');
+  if (type === 'sale' && voucher && (paid === 0 || paymentMethod === '现金')) return sendError(res, '收款凭证仅用于已结账的非现金销售单');
   try {
     const create = db.transaction(() => {
       if (suspendedId !== undefined) {
@@ -710,13 +909,14 @@ app.post('/api/orders', (req, res) => {
       const result = db.prepare('INSERT INTO orders (number,type,date,party_id,party_name,total_cents,paid_cents,planned_paid_cents,payment_method,audited,note) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(number, type, date, party.id, party.name, total, 0, paid, paymentMethod, 0, text(note, 500));
       const orderId = Number(result.lastInsertRowid);
       saveOrderVoucher(orderId, voucher);
-      const insertItem = db.prepare('INSERT INTO order_items (order_id,product_id,product_name,specification,unit,quantity,unit_price_cents,subtotal_cents) VALUES (?,?,?,?,?,?,?,?)');
+      saveOrderSalesLists(orderId, salesLists.items);
+      const insertItem = db.prepare('INSERT INTO order_items (order_id,product_id,product_name,specification,unit,quantity,unit_price_cents,cost_cents,subtotal_cents) VALUES (?,?,?,?,?,?,?,?,?)');
       for (const line of lines) {
-        insertItem.run(orderId, line.product.id, line.product.name, line.product.specification, line.product.unit, line.quantity, line.unitPrice, line.subtotal);
+        insertItem.run(orderId, line.product.id, line.product.name, line.product.specification, line.product.unit, line.quantity, line.unitPrice, line.product.cost_cents, line.subtotal);
       }
       return db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
     });
-    return res.status(201).json({ ...serializeOrder(create()), items: lines.map((line) => ({ product_name: line.product.name, specification: line.product.specification, unit: line.product.unit, quantity: line.quantity, unit_price: asMoney(line.unitPrice), subtotal: asMoney(line.subtotal) })) });
+    return res.status(201).json({ ...serializeOrder(create()), items: lines.map((line) => ({ product_name: line.product.name, specification: line.product.specification, unit: line.product.unit, quantity: line.quantity, unit_price: asMoney(line.unitPrice), cost: asMoney(line.product.cost_cents), subtotal: asMoney(line.subtotal) })) });
   } catch (error) { return sendError(res, error.message, 409); }
 });
 function applyOrderAudit(order) {
@@ -750,10 +950,14 @@ app.put('/api/orders/:id', (req, res) => {
   if (!id) return sendError(res, '单据编号无效');
   const existing = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!existing) return sendError(res, '单据不存在', 404);
+  if (existing.audited || !existing.reversed && existing.type !== 'sale') return sendError(res, '只有反审核订单或未审核销售订单才能编辑', 409);
   const { type, partyId: rawPartyId, date: rawDate, note = '', items: rawItems, paidAmount: rawPaidAmount = 0, paymentMethod: rawPaymentMethod = '' } = req.body || {};
   const hasVoucherChange = Object.hasOwn(req.body || {}, 'paymentVoucher');
   const voucher = !hasVoucherChange || req.body.paymentVoucher === null ? null : parsePaymentVoucher(req.body.paymentVoucher);
   if (voucher?.error) return sendError(res, voucher.error);
+  const hasSalesListsChange = Object.hasOwn(req.body || {}, 'salesListVouchers');
+  const salesLists = !hasSalesListsChange ? { items: [] } : parseSalesListVouchers(req.body.salesListVouchers);
+  if (salesLists.error) return sendError(res, salesLists.error);
   const date = dateValue(rawDate);
   if (type !== existing.type) return sendError(res, '单据类型无效');
   if (!date) return sendError(res, '请选择有效单据日期');
@@ -772,6 +976,15 @@ app.put('/api/orders/:id', (req, res) => {
     if (!product || count === null || unitPrice === null) return sendError(res, '商品、数量或单价无效');
     lines.push({ product, quantity: count, unitPrice, subtotal: Math.round(count * unitPrice) });
   }
+  if (type === 'sale') {
+    const quantities = new Map();
+    for (const line of lines) quantities.set(line.product.id, (quantities.get(line.product.id) || 0) + line.quantity);
+    for (const line of lines) {
+      const quantity = quantities.get(line.product.id);
+      if (quantity > line.product.stock) return sendError(res, `“${line.product.name}”库存不足：当前库存 ${line.product.stock}，订单数量 ${quantity}`, 409);
+      quantities.delete(line.product.id);
+    }
+  }
   const total = lines.reduce((sum, line) => sum + line.subtotal, 0);
   const paid = cents(rawPaidAmount);
   if (paid === null || paid > total) return sendError(res, `${type === 'sale' ? '收款' : '付款'}金额不能小于零或超过单据金额`);
@@ -784,54 +997,23 @@ app.put('/api/orders/:id', (req, res) => {
   const paymentMethods = ['现金', '微信', '支付宝', '银行转账', '其他'];
   const paymentMethod = paid === 0 ? (type === 'sale' ? '未收款' : '未付款') : text(rawPaymentMethod, 30);
   if (paid > 0 && !paymentMethods.includes(paymentMethod)) return sendError(res, `请选择有效的${type === 'sale' ? '收款' : '付款'}方式`);
+  if (type === 'purchase' && salesLists.items.length) return sendError(res, '采购订单不能上传销售清单');
+  if (type === 'sale' && voucher && (paid === 0 || paymentMethod === '现金')) return sendError(res, '收款凭证仅用于已结账的非现金销售单');
   try {
     const update = db.transaction(() => {
-      const previousItems = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(id);
-      if (!existing.audited) {
-        db.prepare('DELETE FROM order_items WHERE order_id = ?').run(id);
-        const insertItem = db.prepare('INSERT INTO order_items (order_id,product_id,product_name,specification,unit,quantity,unit_price_cents,subtotal_cents) VALUES (?,?,?,?,?,?,?,?)');
-        for (const line of lines) insertItem.run(id, line.product.id, line.product.name, line.product.specification, line.product.unit, line.quantity, line.unitPrice, line.subtotal);
-        db.prepare('UPDATE orders SET date = ?, party_id = ?, party_name = ?, total_cents = ?, planned_paid_cents = ?, payment_method = ?, note = ? WHERE id = ?')
-          .run(date, party.id, party.name, total, paid, paymentMethod, text(note, 500), id);
-        if (hasVoucherChange) saveOrderVoucher(id, voucher);
-        if (existing.reversed) return applyOrderAudit(existing);
-        return db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
-      }
-      const stockDeltas = new Map();
-      const direction = type === 'purchase' ? 1 : -1;
-      for (const item of previousItems) {
-        stockDeltas.set(item.product_id, (stockDeltas.get(item.product_id) || 0) - direction * item.quantity);
-      }
-      for (const line of lines) {
-        stockDeltas.set(line.product.id, (stockDeltas.get(line.product.id) || 0) + direction * line.quantity);
-      }
-      for (const [productId, delta] of stockDeltas) {
-        if (delta === 0) continue;
-        const product = db.prepare('SELECT name, stock FROM products WHERE id = ?').get(productId);
-        if (!product || product.stock + delta < 0) {
-          throw new Error(type === 'sale'
-            ? `${product?.name || '商品'} 库存不足，无法保存修改`
-            : `${product?.name || '商品'} 库存不足，无法减少采购数量`);
-        }
-        db.prepare('UPDATE products SET stock = stock + ? WHERE id = ?').run(delta, productId);
-      }
-      const movement = db.prepare('INSERT INTO stock_movements (product_id,order_id,kind,quantity_delta,note) VALUES (?,?,?,?,?)');
-      for (const item of previousItems) {
-        movement.run(item.product_id, id, type, -direction * item.quantity, `${existing.number} 编辑冲销`);
-      }
       db.prepare('DELETE FROM order_items WHERE order_id = ?').run(id);
-      const insertItem = db.prepare('INSERT INTO order_items (order_id,product_id,product_name,specification,unit,quantity,unit_price_cents,subtotal_cents) VALUES (?,?,?,?,?,?,?,?)');
-      for (const line of lines) {
-        insertItem.run(id, line.product.id, line.product.name, line.product.specification, line.product.unit, line.quantity, line.unitPrice, line.subtotal);
-        movement.run(line.product.id, id, type, direction * line.quantity, existing.number);
-      }
-      db.prepare('UPDATE orders SET date = ?, party_id = ?, party_name = ?, total_cents = ?, paid_cents = ?, planned_paid_cents = ?, payment_method = ?, note = ? WHERE id = ?')
-        .run(date, party.id, party.name, total, paid, paid, paymentMethod, text(note, 500), id);
+      const insertItem = db.prepare('INSERT INTO order_items (order_id,product_id,product_name,specification,unit,quantity,unit_price_cents,cost_cents,subtotal_cents) VALUES (?,?,?,?,?,?,?,?,?)');
+      for (const line of lines) insertItem.run(id, line.product.id, line.product.name, line.product.specification, line.product.unit, line.quantity, line.unitPrice, line.product.cost_cents, line.subtotal);
+      db.prepare('UPDATE orders SET date = ?, party_id = ?, party_name = ?, total_cents = ?, planned_paid_cents = ?, payment_method = ?, note = ? WHERE id = ?')
+        .run(date, party.id, party.name, total, paid, paymentMethod, text(note, 500), id);
       if (hasVoucherChange) saveOrderVoucher(id, voucher);
-      return db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+      if (hasSalesListsChange) saveOrderSalesLists(id, salesLists.items);
+      return existing.reversed
+        ? applyOrderAudit(existing)
+        : db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
     });
     const order = update();
-    return res.json({ ...serializeOrder(order), items: lines.map((line) => ({ product_name: line.product.name, specification: line.product.specification, unit: line.product.unit, quantity: line.quantity, unit_price: asMoney(line.unitPrice), subtotal: asMoney(line.subtotal) })) });
+    return res.json({ ...serializeOrder(order), items: lines.map((line) => ({ product_name: line.product.name, specification: line.product.specification, unit: line.product.unit, quantity: line.quantity, unit_price: asMoney(line.unitPrice), cost: asMoney(line.product.cost_cents), subtotal: asMoney(line.subtotal) })) });
   } catch (error) { return sendError(res, error.message, 409); }
 });
 app.post('/api/orders/:id/reverse', (req, res) => {
@@ -902,6 +1084,15 @@ app.get('/api/orders/:id/voucher', (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   return res.type(voucher.mime_type).send(Buffer.from(voucher.data_base64, 'base64'));
 });
+app.get('/api/orders/:orderId/sales-lists/:voucherId', (req, res) => {
+  const orderId = integerId(req.params.orderId);
+  const voucherId = integerId(req.params.voucherId);
+  if (!orderId || !voucherId) return sendError(res, '销售清单编号无效');
+  const voucher = db.prepare('SELECT file_name, mime_type, data_base64 FROM order_sales_lists WHERE order_id = ? AND id = ?').get(orderId, voucherId);
+  if (!voucher) return sendError(res, '该销售清单不存在', 404);
+  res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(voucher.file_name)}`);
+  return res.type(voucher.mime_type).send(Buffer.from(voucher.data_base64, 'base64'));
+});
 app.get('/api/stock', (_req, res) => res.json(db.prepare('SELECT * FROM products ORDER BY name COLLATE NOCASE').all().map(serializeProduct)));
 app.get('/api/stock/movements', (req, res) => {
   const from = dateValue(req.query.from); const to = dateValue(req.query.to);
@@ -910,7 +1101,7 @@ app.get('/api/stock/movements', (req, res) => {
   if (from) { clauses.push("date(stock_movements.created_at) >= ?"); values.push(from); }
   if (to) { clauses.push("date(stock_movements.created_at) <= ?"); values.push(to); }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  return res.json(db.prepare(`SELECT stock_movements.*, products.name AS product_name, products.unit FROM stock_movements JOIN products ON products.id = stock_movements.product_id ${where} ORDER BY stock_movements.id DESC LIMIT 500`).all(...values));
+  return res.json(db.prepare(`SELECT stock_movements.id, stock_movements.product_id, stock_movements.order_id, stock_movements.kind, stock_movements.quantity_delta, stock_movements.note, stock_movements.created_at, COALESCE(products.name, stock_movements.product_name) AS product_name, COALESCE(products.unit, stock_movements.product_unit) AS unit FROM stock_movements LEFT JOIN products ON products.id = stock_movements.product_id ${where} ORDER BY stock_movements.id DESC LIMIT 500`).all(...values));
 });
 app.post('/api/stocktakes', (req, res) => {
   const date = dateValue(req.body?.date);
@@ -962,7 +1153,7 @@ app.get('/api/stocktakes/:id', (req, res) => {
   return res.json({ ...stocktake, items });
 });
 
-const backupTables = ['settings','units','categories','suppliers','customers','products','orders','customer_receipts','customer_receipt_allocations','customer_receipt_vouchers','supplier_payments','supplier_payment_allocations','order_items','order_vouchers','stock_movements','stocktakes','stocktake_items','suspended_orders'];
+const backupTables = ['settings','units','categories','suppliers','customers','products','orders','customer_receipts','customer_receipt_allocations','customer_receipt_vouchers','supplier_payments','supplier_payment_allocations','order_items','order_vouchers','order_sales_lists','stock_movements','stocktakes','stocktake_items','suspended_orders'];
 app.get('/api/backup', (_req, res) => {
   const backup = { format: 'jxc-backup', version: 1, createdAt: new Date().toISOString(), data: Object.fromEntries(backupTables.map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()])) };
   res.setHeader('Content-Disposition', `attachment; filename="jxc-backup-${new Date().toISOString().slice(0,10)}.json"`);
@@ -970,17 +1161,19 @@ app.get('/api/backup', (_req, res) => {
 });
 app.post('/api/restore', (req, res) => {
   const backup = req.body;
-  const optionalTables = ['categories', 'order_vouchers', 'customer_receipts', 'customer_receipt_allocations', 'customer_receipt_vouchers', 'supplier_payments', 'supplier_payment_allocations', 'suspended_orders'];
+  const optionalTables = ['categories', 'order_vouchers', 'order_sales_lists', 'customer_receipts', 'customer_receipt_allocations', 'customer_receipt_vouchers', 'supplier_payments', 'supplier_payment_allocations', 'suspended_orders'];
   if (backup?.format !== 'jxc-backup' || backup.version !== 1 || !backup.data || backupTables.filter((table) => !optionalTables.includes(table)).some((table) => !Array.isArray(backup.data[table])) || optionalTables.some((table) => backup.data[table] !== undefined && !Array.isArray(backup.data[table]))) return sendError(res, '备份文件格式不受支持');
   try {
     const restore = db.transaction(() => {
       db.pragma('defer_foreign_keys = ON');
       for (const table of [...backupTables].reverse()) db.prepare(`DELETE FROM ${table}`).run();
-      const columns = { settings: ['key','value'], units: ['id','name'], categories: ['id','name','created_at'], suppliers: ['id','name','contact','phone','email','address','note','created_at'], customers: ['id','name','contact','phone','email','address','note','created_at'], products: ['id','sku','name','specification','unit','category_id','cost_cents','price_cents','stock','threshold','stock_alert_enabled','note','created_at'], orders: ['id','number','type','date','party_id','party_name','total_cents','paid_cents','planned_paid_cents','payment_method','audited','reversed','note','created_at'], customer_receipts: ['id','customer_id','date','total_cents','payment_method','note','created_at'], customer_receipt_allocations: ['id','receipt_id','order_id','amount_cents'], customer_receipt_vouchers: ['receipt_id','mime_type','data_base64'], supplier_payments: ['id','supplier_id','date','total_cents','payment_method','note','created_at'], supplier_payment_allocations: ['id','payment_id','order_id','amount_cents'], order_items: ['id','order_id','product_id','product_name','specification','unit','quantity','unit_price_cents','subtotal_cents'], order_vouchers: ['order_id','mime_type','data_base64'], stock_movements: ['id','product_id','order_id','kind','quantity_delta','note','created_at'], stocktakes: ['id','number','date','category_id','note','created_at'], stocktake_items: ['id','stocktake_id','product_id','product_name','expected','counted','difference'], suspended_orders: ['id','version','data'] };
+      const columns = { settings: ['key','value'], units: ['id','name'], categories: ['id','name','created_at'], suppliers: ['id','name','contact','phone','email','address','note','created_at'], customers: ['id','name','contact','phone','email','address','note','created_at'], products: ['id','sku','name','specification','unit','category_id','cost_cents','price_cents','stock','threshold','stock_alert_enabled','note','created_at'], orders: ['id','number','type','date','party_id','party_name','total_cents','paid_cents','planned_paid_cents','payment_method','audited','reversed','note','created_at'], customer_receipts: ['id','customer_id','date','total_cents','payment_method','note','created_at'], customer_receipt_allocations: ['id','receipt_id','order_id','amount_cents'], customer_receipt_vouchers: ['receipt_id','mime_type','data_base64'], supplier_payments: ['id','supplier_id','date','total_cents','payment_method','note','created_at'], supplier_payment_allocations: ['id','payment_id','order_id','amount_cents'], order_items: ['id','order_id','product_id','product_name','specification','unit','quantity','unit_price_cents','cost_cents','subtotal_cents'], order_vouchers: ['order_id','mime_type','data_base64'], order_sales_lists: ['id','order_id','file_name','mime_type','data_base64'], stock_movements: ['id','product_id','order_id','kind','quantity_delta','note','created_at'], stocktakes: ['id','number','date','category_id','note','created_at'], stocktake_items: ['id','stocktake_id','product_id','product_name','expected','counted','difference'], suspended_orders: ['id','version','data'] };
+      columns.stock_movements.push('product_name', 'product_unit');
       const categoryInsert = db.prepare('INSERT INTO categories (id,name,created_at) VALUES (?,?,?)');
       for (const row of backup.data.categories || []) categoryInsert.run(row.id, row.name, row.created_at || new Date().toISOString());
       db.prepare("INSERT OR IGNORE INTO categories (name) VALUES ('未分类')").run();
       const uncategorizedId = db.prepare("SELECT id FROM categories WHERE name = '未分类'").get().id;
+      const backupProductCosts = new Map((backup.data.products || []).map((product) => [product.id, product.cost_cents ?? 0]));
       for (const table of backupTables) {
         if (table === 'categories') continue;
         const fields = columns[table]; const insert = db.prepare(`INSERT INTO ${table} (${fields.join(',')}) VALUES (${fields.map(() => '?').join(',')})`);
@@ -992,6 +1185,7 @@ app.post('/api/restore', (req, res) => {
           if (table === 'orders' && field === 'payment_method' && row[field] === undefined) return '历史单据（按已结清处理）';
           if (table === 'products' && field === 'stock_alert_enabled' && row[field] === undefined) return 1;
           if (table === 'products' && field === 'category_id' && row[field] == null) return uncategorizedId;
+          if (table === 'order_items' && field === 'cost_cents' && row[field] === undefined) return backupProductCosts.get(row.product_id) ?? 0;
           return row[field] ?? null;
         }));
       }
@@ -1016,4 +1210,18 @@ app.use((error, _req, res, _next) => {
   if (error instanceof SyntaxError && 'body' in error) return sendError(res, '请求数据格式无效');
   return res.status(500).json({ error: '服务器内部错误' });
 });
-app.listen(port, '0.0.0.0', () => console.log(`JXC listening on ${port}`));
+if (process.argv.includes('--reset-super-admin')) {
+  const user = superAdmin && accountsDb.prepare('SELECT id FROM users WHERE username = ?').get(superAdmin);
+  if (!user) throw new Error('Configured SUPER_ADMIN account does not exist.');
+  const temporaryPassword = `A1${crypto.randomBytes(12).toString('hex')}`;
+  const { salt, hash } = hashPassword(temporaryPassword);
+  accountsDb.prepare('UPDATE users SET salt = ?, password_hash = ?, enabled = 1, recovery_hash = NULL, must_change_password = 1, session_version = session_version + 1 WHERE id = ?').run(salt, hash, user.id);
+  console.log(`临时密码（仅显示一次）：${temporaryPassword}`);
+  accountsDb.close();
+  defaultDatabase.close();
+} else {
+  if (superAdmin && !accountsDb.prepare('SELECT id FROM users WHERE username = ?').get(superAdmin)) {
+    console.warn(`SUPER_ADMIN account "${superAdmin}" does not exist; administrator access is unavailable.`);
+  }
+  app.listen(port, '0.0.0.0', () => console.log(`JXC listening on ${port}`));
+}

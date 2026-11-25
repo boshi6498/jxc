@@ -58,9 +58,69 @@ test('反审核订单的删除与编辑重新生效', async () => {
     const stock = async () => (await request('/api/init')).products.find((item) => item.id === product.id).stock;
     const order = async (id) => (await request('/api/orders')).find((item) => item.id === id);
 
+    const insufficientSale = await request('/api/orders', 'POST', body('sale', 11, 5), 409);
+    assert.match(insufficientSale.error, /库存不足/);
+    const splitInsufficientSale = await request('/api/orders', 'POST', {
+      ...body('sale', 2),
+      items: [
+        { productId: product.id, quantity: 6, unitPrice: 5 },
+        { productId: product.id, quantity: 5, unitPrice: 5 },
+      ],
+    }, 409);
+    assert.match(splitInsufficientSale.error, /订单数量 11/);
+    assert.equal((await request('/api/orders')).length, 0);
+
     const saleDraft = await request('/api/orders', 'POST', body('sale', 2, 5), 201);
     assert.equal(saleDraft.audited, false);
     assert.equal(saleDraft.reversed, false);
+    assert.equal(saleDraft.items[0].cost, 2);
+    await request(`/api/products/${product.id}`, 'PUT', { ...product, cost: 3 });
+    assert.equal((await order(saleDraft.id)).items[0].cost, 2);
+    await request(`/api/products/${product.id}`, 'PUT', { ...product, cost: 2 });
+    assert.match((await request(`/api/orders/${saleDraft.id}`, 'PUT', body('sale', 11), 409)).error, /库存不足/);
+    assert.equal((await order(saleDraft.id)).items[0].quantity, 2);
+    const updatedSaleDraft = await request(`/api/orders/${saleDraft.id}`, 'PUT', body('sale', 3));
+    assert.equal(updatedSaleDraft.audited, false);
+    assert.equal(updatedSaleDraft.reversed, false);
+    assert.equal(updatedSaleDraft.items[0].quantity, 3);
+    assert.equal(await stock(), 10);
+
+    const image = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+    const voucherSale = await request('/api/orders', 'POST', {
+      ...body('sale', 1, 5),
+      paymentMethod: '微信',
+      paymentVoucher: image,
+      salesListVouchers: [
+        { fileName: '销售清单一.png', dataUrl: image },
+        { fileName: '销售清单二.png', dataUrl: image },
+      ],
+    }, 201);
+    const listedVoucherSale = await order(voucherSale.id);
+    assert.equal(Boolean(listedVoucherSale.has_voucher), true);
+    assert.deepEqual(listedVoucherSale.sales_list_vouchers.map((item) => item.fileName), ['销售清单一.png', '销售清单二.png']);
+    const firstList = listedVoucherSale.sales_list_vouchers[0];
+    const listResponse = await fetch(`${base}/api/orders/${voucherSale.id}/sales-lists/${firstList.id}`, { headers: { Cookie: cookie } });
+    assert.equal(listResponse.status, 200);
+    assert.match(listResponse.headers.get('content-type'), /^image\/png/);
+    await request(`/api/orders/${voucherSale.id}`, 'PUT', {
+      ...body('sale', 1, 5),
+      paymentMethod: '微信',
+      salesListVouchers: [
+        { id: firstList.id, fileName: '销售清单一.png' },
+        { fileName: '新增销售清单.png', dataUrl: image },
+      ],
+    });
+    assert.deepEqual((await order(voucherSale.id)).sales_list_vouchers.map((item) => item.fileName), ['销售清单一.png', '新增销售清单.png']);
+    await request('/api/orders', 'POST', {
+      ...body('sale', 1, 5),
+      paymentMethod: '现金',
+      paymentVoucher: image,
+    }, 400);
+    await request(`/api/orders/${voucherSale.id}`, 'DELETE');
+
+    await request(`/api/orders/${saleDraft.id}/audit`, 'POST');
+    assert.equal(await stock(), 7);
+    await request(`/api/orders/${saleDraft.id}/reverse`, 'POST');
     assert.equal(await stock(), 10);
     await request(`/api/orders/${saleDraft.id}`, 'DELETE');
     assert.equal(await order(saleDraft.id), undefined);
@@ -69,6 +129,8 @@ test('反审核订单的删除与编辑重新生效', async () => {
     await request(`/api/orders/${saleDraft.id}`, 'DELETE', undefined, 404);
 
     const purchaseDraft = await request('/api/orders', 'POST', body('purchase', 2, 5), 201);
+    assert.match((await request(`/api/orders/${purchaseDraft.id}`, 'PUT', body('purchase', 3), 409)).error, /只有反审核/);
+    assert.equal((await order(purchaseDraft.id)).items[0].quantity, 2);
     await request(`/api/orders/${purchaseDraft.id}`, 'DELETE');
     assert.equal(await order(purchaseDraft.id), undefined);
     assert.equal(await stock(), 10);
@@ -76,11 +138,12 @@ test('反审核订单的删除与编辑重新生效', async () => {
     await request(`/api/orders/${purchaseDraft.id}`, 'DELETE', undefined, 404);
 
     const draft = await request('/api/orders', 'POST', body('purchase', 2), 201);
-    await request(`/api/orders/${draft.id}`, 'PUT', body('purchase', 3));
     assert.equal((await order(draft.id)).audited, false);
     assert.equal(await stock(), 10);
     await request(`/api/orders/${draft.id}/audit`, 'POST');
-    assert.equal(await stock(), 13);
+    assert.equal(await stock(), 12);
+    assert.match((await request(`/api/orders/${draft.id}`, 'PUT', body('purchase', 3), 409)).error, /只有反审核/);
+    assert.equal((await order(draft.id)).items[0].quantity, 2);
     await request(`/api/orders/${draft.id}`, 'DELETE', undefined, 409);
     await request(`/api/orders/${draft.id}/reverse`, 'POST');
     assert.equal(await stock(), 10);
@@ -103,6 +166,8 @@ test('反审核订单的删除与编辑重新生效', async () => {
     const sale = await request('/api/orders', 'POST', body('sale', 3, 5), 201);
     await request(`/api/orders/${sale.id}/audit`, 'POST');
     assert.equal(await stock(), 11);
+    assert.match((await request(`/api/orders/${sale.id}`, 'PUT', body('sale', 4), 409)).error, /只有反审核/);
+    assert.equal((await order(sale.id)).items[0].quantity, 3);
     await request(`/api/orders/${sale.id}`, 'DELETE', undefined, 409);
     assert.equal(await stock(), 11);
     assert.equal((await order(sale.id)).audited, true);
